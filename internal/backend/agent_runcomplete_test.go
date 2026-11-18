@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/charmbracelet/crush/internal/config"
+
 	"charm.land/fantasy"
 	"github.com/charmbracelet/crush/internal/agent"
 	"github.com/charmbracelet/crush/internal/app"
@@ -53,6 +55,10 @@ func (c *errorCoordinator) MainAgent() string                                 { 
 func (c *errorCoordinator) GenerateTitle(context.Context, string, string)     {}
 func (c *errorCoordinator) SetHostContext(proto.HostContext)                  {}
 func (c *errorCoordinator) HostContext() proto.HostContext                    { return proto.HostContext{} }
+func (c *errorCoordinator) SessionModel(string) agent.Model                   { return agent.Model{} }
+func (c *errorCoordinator) SetSessionModel(context.Context, string, config.SelectedModel) error {
+	return nil
+}
 
 // insertRunCompleteWorkspace installs a workspace backed by a real
 // app.App (so the runCompletions broker exists) with the given
