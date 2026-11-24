@@ -479,6 +479,7 @@ func messageToProto(m message.Message) proto.Message {
 				Output: v.Output,
 				Failed: v.Failed,
 				Model:  v.Model,
+				Job:    v.Job,
 			})
 		}
 	}

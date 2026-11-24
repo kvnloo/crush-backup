@@ -73,6 +73,7 @@ type bashDescriptionData struct {
 	ModelID         string
 	RgAvailable     bool
 	GhAvailable     bool
+	JobReports      bool
 }
 
 // defaultBlockedCommands is the built-in dangerous-command list. It is a
@@ -204,7 +205,7 @@ func resolveBlockedCommands(perms *config.Permissions) []string {
 	return deduped
 }
 
-func bashDescription(attribution *config.Attribution, modelID string, blocked []string) string {
+func bashDescription(attribution *config.Attribution, modelID string, blocked []string, jobReports bool) string {
 	var out bytes.Buffer
 	if err := bashDescriptionTpl.Execute(&out, bashDescriptionData{
 		BannedCommands:  strings.Join(blocked, ", "),
@@ -213,6 +214,7 @@ func bashDescription(attribution *config.Attribution, modelID string, blocked []
 		ModelID:         modelID,
 		RgAvailable:     getRg() != "",
 		GhAvailable:     ghAvailable,
+		JobReports:      jobReports,
 	}); err != nil {
 		// this should never happen.
 		panic("failed to execute bash description template: " + err.Error())
@@ -264,7 +266,7 @@ func NewBashTool(permissions permission.Service, workingDir, spillDir string, at
 	userSafe := userSafeCommands(perms)
 	return fantasy.NewAgentTool(
 		BashToolName,
-		string(bashDescription(attribution, modelID, blocked)),
+		string(bashDescription(attribution, modelID, blocked, jobs.Reports())),
 		func(ctx context.Context, params BashParams, call fantasy.ToolCall) (fantasy.ToolResponse, error) {
 			if params.Command == "" {
 				return fantasy.NewTextErrorResponse("missing command"), nil
@@ -327,7 +329,7 @@ func NewBashTool(permissions permission.Service, workingDir, spillDir string, at
 				return fantasy.NewTextErrorResponse(err.Error()), nil
 			}
 			reporter := newProgressReporter(progress, sessionID, call.ID)
-			return executeBashCommand(ctx, params, execWorkingDir, spillDir, blocksToUse, maxBackgroundJobs, scope, reporter)
+			return executeBashCommand(ctx, params, execWorkingDir, spillDir, blocksToUse, maxBackgroundJobs, jobs, scope, reporter)
 		},
 	)
 }
@@ -337,7 +339,7 @@ func yoloBlockedMessage(command string) string {
 	return fmt.Sprintf("blocked: %s is a dangerous command, and yolo mode blocks dangerous commands without asking. Tell the user: they can switch to normal mode to be asked about it, use sysadmin mode to allow it, or mark it safe with `permissions safe`.", command)
 }
 
-func executeBashCommand(ctx context.Context, params BashParams, execWorkingDir, spillDir string, blockFuncsToUse []shell.BlockFunc, maxBackgroundJobs int, scope shell.JobScope, progress *progressReporter) (fantasy.ToolResponse, error) {
+func executeBashCommand(ctx context.Context, params BashParams, execWorkingDir, spillDir string, blockFuncsToUse []shell.BlockFunc, maxBackgroundJobs int, jobs BackgroundJobs, scope shell.JobScope, progress *progressReporter) (fantasy.ToolResponse, error) {
 	// If explicitly requested as background, start immediately with detached context
 	if params.RunInBackground {
 		startTime := time.Now()
@@ -381,6 +383,7 @@ func executeBashCommand(ctx context.Context, params BashParams, execWorkingDir, 
 		}
 
 		// Still running after fast-failure check - return as background job
+		jobs.watch(scope, bgShell)
 		metadata := BashResponseMetadata{
 			StartTime:        startTime.UnixMilli(),
 			EndTime:          time.Now().UnixMilli(),
@@ -389,7 +392,7 @@ func executeBashCommand(ctx context.Context, params BashParams, execWorkingDir, 
 			Background:       true,
 			ShellID:          bgShell.ID,
 		}
-		response := fmt.Sprintf("Background shell started with ID: %s\n\nUse job_output tool to view output or job_kill to terminate.", bgShell.ID)
+		response := fmt.Sprintf("Background shell started with ID: %s\n\n%s", bgShell.ID, jobs.nextSteps())
 		return fantasy.WithResponseMetadata(fantasy.NewTextResponse(response), metadata), nil
 	}
 
@@ -460,6 +463,7 @@ wait:
 
 	// Still running - keep as background job
 	bgShell.MarkBackground()
+	jobs.watch(scope, bgShell)
 	metadata := BashResponseMetadata{
 		StartTime:        startTime.UnixMilli(),
 		EndTime:          time.Now().UnixMilli(),
@@ -468,7 +472,7 @@ wait:
 		Background:       true,
 		ShellID:          bgShell.ID,
 	}
-	response := fmt.Sprintf("Command is taking longer than expected and has been moved to background.\n\nBackground shell ID: %s\n\nUse job_output tool to view output or job_kill to terminate.", bgShell.ID)
+	response := fmt.Sprintf("Command is taking longer than expected and has been moved to background.\n\nBackground shell ID: %s\n\n%s", bgShell.ID, jobs.nextSteps())
 	return fantasy.WithResponseMetadata(fantasy.NewTextResponse(response), metadata), nil
 }
 
