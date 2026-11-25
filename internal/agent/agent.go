@@ -2380,12 +2380,14 @@ func (a *sessionAgent) CancelAll() {
 		for key := range a.acceptedRuns.Seq2() {
 			a.Cancel(key)
 		}
+		// A cancelled run unwinds in milliseconds, and quitting waits on
+		// this, so poll finely rather than in coarse ticks.
 		for a.IsBusy() {
 			if time.Now().After(deadline) {
 				slog.Warn("Gave up waiting for agent runs to cancel; their final state may not be recorded")
 				break
 			}
-			time.Sleep(200 * time.Millisecond)
+			time.Sleep(10 * time.Millisecond)
 		}
 	}
 	// Quitting should not wait on the model for a title nobody has seen

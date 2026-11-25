@@ -1022,6 +1022,13 @@ func (app *App) Shutdown() {
 	start := time.Now()
 	defer func() { slog.Debug("Shutdown took " + time.Since(start).String()) }()
 
+	// Send the exit event first and flush it alongside everything else. The
+	// PostHog client only notices a finished upload on a 100 ms tick, so
+	// waiting for it last would add that tick to every exit.
+	var telemetry sync.WaitGroup
+	telemetry.Go(event.AppExited)
+	defer telemetry.Wait()
+
 	// First, cancel all agents and wait for them to finish. This must complete
 	// before closing the DB so agents can finish writing their state.
 	startuptrace.Phase(context.Background(), "cancel agents", func() {
@@ -1049,11 +1056,6 @@ func (app *App) Shutdown() {
 
 	// Now run remaining cleanup tasks in parallel.
 	var wg sync.WaitGroup
-
-	// Send exit event
-	wg.Go(func() {
-		event.AppExited()
-	})
 
 	// Kill the background shells this app started. The shell manager is
 	// shared by the whole process, and the server hosts one app per
