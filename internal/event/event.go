@@ -1,6 +1,7 @@
 package event
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"os"
@@ -165,10 +166,23 @@ func Error(errToLog any, props ...any) {
 	})
 }
 
-// Flush sends every queued event, waiting for Init to finish first.
+// flushTimeout bounds how long exiting waits for the last events to upload.
+const flushTimeout = 500 * time.Millisecond
+
+// Flush sends every queued event and closes the client, waiting for Init
+// to finish first.
+//
+// Close drains on its own, but only notices a finished upload on a 100 ms
+// ticker, which added that much to every exit. FlushWithContext returns the
+// moment the upload lands, so Close then finds nothing in flight.
 func Flush() {
 	if !waitReady() || client == nil {
 		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), flushTimeout)
+	defer cancel()
+	if err := client.FlushWithContext(ctx); err != nil {
+		slog.Warn("Failed to flush PostHog events", "error", err)
 	}
 	if err := client.Close(); err != nil {
 		slog.Error("Failed to flush PostHog events", "error", err)
