@@ -366,12 +366,11 @@ func stubChatGPTModels(t *testing.T, models []catwalk.Model) *bool {
 	return &called
 }
 
-// TestLoadRefreshesChatGPTModelsWhenCatwalkUpdates covers the startup
-// wiring: when Catwalk delivers a fresh catalog, the ChatGPT model catalog
-// is refreshed in the same run, and the config Load publishes afterwards
-// still carries the resolved default models (the refresh swaps the config
-// out from under Load, which must re-read it).
-func TestLoadRefreshesChatGPTModelsWhenCatwalkUpdates(t *testing.T) {
+// TestRefreshCatalogsRefreshesChatGPTModelsWhenCatwalkUpdates covers the
+// background wiring: startup does not wait on the ChatGPT catalog, and when
+// Catwalk delivers a fresh catalog the refresh renews it and reloads,
+// keeping the resolved default models.
+func TestRefreshCatalogsRefreshesChatGPTModelsWhenCatwalkUpdates(t *testing.T) {
 	// Not parallel: swaps package-level provider state and the fetch
 	// stub, and sets environment variables.
 	workDir, dataDir := isolateLoadEnv(t)
@@ -399,7 +398,11 @@ func TestLoadRefreshesChatGPTModelsWhenCatwalkUpdates(t *testing.T) {
 
 	store, err := Load(t.Context(), workDir, dataDir, false)
 	require.NoError(t, err)
+	require.False(t, *fetched, "startup leaves the ChatGPT catalog to the background refresh")
 
+	reloaded, err := store.RefreshCatalogs(t.Context())
+	require.NoError(t, err)
+	require.True(t, reloaded)
 	require.True(t, CatwalkUpdated(), "the stub served a fresh catalog")
 	require.True(t, *fetched, "the ChatGPT catalog refresh rides the Catwalk update")
 

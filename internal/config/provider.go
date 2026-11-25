@@ -27,6 +27,7 @@ type syncer[T any] interface {
 
 var (
 	providerOnce sync.Once
+	providerMu   sync.RWMutex // Guards providerList and providerErr.
 	providerList []catwalk.Provider
 	providerErr  error
 )
@@ -39,24 +40,28 @@ func cachePathFor(name string) string {
 
 // UpdateProviders updates the Catwalk providers list from a specified source.
 func UpdateProviders(pathOrURL string) error {
-	var providers []catwalk.Provider
+	var data []byte
 	pathOrURL = cmp.Or(pathOrURL, os.Getenv("CATWALK_URL"), defaultCatwalkURL)
 
 	switch {
 	case pathOrURL == "embedded":
-		providers = embedded.GetAll()
+		var err error
+		if data, err = json.Marshal(embedded.GetAll()); err != nil {
+			return fmt.Errorf("failed to marshal embedded providers: %w", err)
+		}
 	case strings.HasPrefix(pathOrURL, "http://") || strings.HasPrefix(pathOrURL, "https://"):
 		var err error
-		providers, err = catwalk.NewWithURL(pathOrURL).GetProviders(context.Background(), "")
+		_, data, err = newCatwalkClient(pathOrURL).GetProviders(context.Background(), "")
 		if err != nil {
 			return fmt.Errorf("failed to fetch providers from Catwalk: %w", err)
 		}
 	default:
-		content, err := os.ReadFile(pathOrURL)
-		if err != nil {
+		var err error
+		if data, err = os.ReadFile(pathOrURL); err != nil {
 			return fmt.Errorf("failed to read file: %w", err)
 		}
-		if err := json.Unmarshal(content, &providers); err != nil {
+		var providers []catwalk.Provider
+		if err := json.Unmarshal(data, &providers); err != nil {
 			return fmt.Errorf("failed to unmarshal provider data: %w", err)
 		}
 		if len(providers) == 0 {
@@ -64,11 +69,11 @@ func UpdateProviders(pathOrURL string) error {
 		}
 	}
 
-	if err := newCache[[]catwalk.Provider](cachePathFor("providers")).Store(providers); err != nil {
+	if err := newCache[[]catwalk.Provider](cachePathFor("providers")).StoreRaw(data); err != nil {
 		return fmt.Errorf("failed to save providers to cache: %w", err)
 	}
 
-	slog.Info("Providers updated successfully", "count", len(providers), "from", pathOrURL, "to", cachePathFor)
+	slog.Info("Providers updated successfully", "from", pathOrURL, "to", cachePathFor)
 	return nil
 }
 
@@ -95,33 +100,36 @@ type HyperTokenRefresher func(context.Context) error
 
 // UpdateHyper updates the Hyper provider information from a specified URL.
 func UpdateHyper(pathOrURL string) error {
-	var provider catwalk.Provider
+	var data []byte
 	pathOrURL = cmp.Or(pathOrURL, hyper.BaseURL())
 
 	switch {
 	case pathOrURL == "embedded":
-		provider = hyper.Embedded()
+		var err error
+		if data, err = json.Marshal(hyper.Embedded()); err != nil {
+			return fmt.Errorf("failed to marshal embedded Hyper provider: %w", err)
+		}
 	case strings.HasPrefix(pathOrURL, "http://") || strings.HasPrefix(pathOrURL, "https://"):
 		client := realHyperClient{
 			baseURL:    pathOrURL,
 			resolveKey: func() string { return ResolveHyperAPIKey(nil) },
 		}
 		var err error
-		provider, err = client.Get(context.Background(), "")
-		if err != nil {
+		if _, data, err = client.Get(context.Background(), ""); err != nil {
 			return fmt.Errorf("failed to fetch provider from Hyper: %w", err)
 		}
 	default:
-		content, err := os.ReadFile(pathOrURL)
-		if err != nil {
+		var err error
+		if data, err = os.ReadFile(pathOrURL); err != nil {
 			return fmt.Errorf("failed to read file: %w", err)
 		}
-		if err := json.Unmarshal(content, &provider); err != nil {
+		var provider catwalk.Provider
+		if err := json.Unmarshal(data, &provider); err != nil {
 			return fmt.Errorf("failed to unmarshal provider data: %w", err)
 		}
 	}
 
-	if err := newCache[catwalk.Provider](cachePathFor("hyper")).Store(provider); err != nil {
+	if err := newCache[catwalk.Provider](cachePathFor("hyper")).StoreRaw(data); err != nil {
 		return fmt.Errorf("failed to save Hyper provider to cache: %w", err)
 	}
 
@@ -135,9 +143,8 @@ var (
 )
 
 // CatwalkUpdated reports whether the Catwalk provider catalog was
-// refreshed with new data during this run's catalog fetch. The fetch
-// runs once per process, before the first call to Providers returns, so
-// the result is stable afterwards. Callers use it to renew catalogs that
+// refreshed with new data during this run, either by a cold start's inline
+// fetch or by RefreshProviders. Callers use it to renew catalogs that
 // shadow Catwalk's, such as the ChatGPT model catalog.
 func CatwalkUpdated() bool {
 	return catwalkSyncer.Updated()
@@ -149,9 +156,10 @@ func CatwalkUpdated() bool {
 // It will:
 // 1. if auto update is disabled, it'll return the embedded providers at the
 // time of release.
-// 2. load the cached providers
-// 3. try to get the fresh list of providers, and return either this new list,
-// the cached list, or the embedded list if all others fail.
+// 2. return the cached providers, leaving RefreshProviders to revalidate
+// them in the background.
+// 3. with no cache, fetch the providers, and return either this new list or
+// the embedded list if that fails.
 //
 // A returned error is advisory: it reports that the catalog could not be
 // cached, or that an upstream returned nothing usable. It never means that no
@@ -186,7 +194,7 @@ func LoadProviders(ctx context.Context, cfg *Config, refreshHyper HyperTokenRefr
 				return
 			}
 			catwalkURL := cmp.Or(os.Getenv("CATWALK_URL"), defaultCatwalkURL)
-			client := catwalk.NewWithURL(catwalkURL)
+			client := newCatwalkClient(catwalkURL)
 			path := cachePathFor("providers")
 			catwalkSyncer.Init(client, path, autoupdate)
 
@@ -229,14 +237,54 @@ func LoadProviders(ctx context.Context, cfg *Config, refreshHyper HyperTokenRefr
 
 		wg.Wait()
 
-		if hyperProvider.ID != "" {
-			providerList = append([]catwalk.Provider{hyperProvider}, slices.Collect(providers.Seq())...)
-		} else {
-			providerList = slices.Collect(providers.Seq())
-		}
+		providerMu.Lock()
+		providerList = joinProviders(hyperProvider, slices.Collect(providers.Seq()))
 		providerErr = errors.Join(catwalkErr, hyperErr)
+		providerMu.Unlock()
 	})
+	providerMu.RLock()
+	defer providerMu.RUnlock()
 	return providerList, providerErr
+}
+
+func joinProviders(hyperProvider catwalk.Provider, rest []catwalk.Provider) []catwalk.Provider {
+	if hyperProvider.ID == "" {
+		return rest
+	}
+	return append([]catwalk.Provider{hyperProvider}, rest...)
+}
+
+// RefreshProviders revalidates the Catwalk and Hyper catalogs that
+// LoadProviders served from the cache, and reports whether either changed.
+// Later calls to Providers return the refreshed list. Meant to run in the
+// background after startup; it does nothing before LoadProviders or when
+// the catalogs were fetched fresh.
+func RefreshProviders(ctx context.Context) (bool, error) {
+	var catwalkChanged, hyperChanged bool
+	var catwalkErr, hyperErr error
+	var wg sync.WaitGroup
+	wg.Go(func() { catwalkChanged, catwalkErr = catwalkSyncer.Revalidate(ctx) })
+	wg.Go(func() { hyperChanged, hyperErr = hyperSyncer.Revalidate(ctx) })
+	wg.Wait()
+	// An error here is advisory, as in LoadProviders: the syncers still
+	// hold a usable catalog.
+	err := errors.Join(catwalkErr, hyperErr)
+	if !catwalkChanged && !hyperChanged {
+		return false, err
+	}
+
+	var items []catwalk.Provider
+	var hyperProvider catwalk.Provider
+	if catwalkSyncer.init.Load() {
+		items, _ = catwalkSyncer.Get(ctx)
+	}
+	if hyperSyncer.init.Load() {
+		hyperProvider, _ = hyperSyncer.Get(ctx)
+	}
+	providerMu.Lock()
+	providerList = joinProviders(hyperProvider, items)
+	providerMu.Unlock()
+	return true, err
 }
 
 // UpdateProviderInList replaces a provider in the memoized provider list
@@ -244,6 +292,8 @@ func LoadProviders(ctx context.Context, cfg *Config, refreshHyper HyperTokenRefr
 // provider (e.g. Hyper after OAuth) so that all callers of Providers()
 // see the updated entry without needing to reset sync.Once.
 func UpdateProviderInList(provider catwalk.Provider) {
+	providerMu.Lock()
+	defer providerMu.Unlock()
 	for i, p := range providerList {
 		if p.ID == provider.ID {
 			providerList[i] = provider
@@ -277,14 +327,19 @@ func (c cache[T]) Get() (T, string, error) {
 }
 
 func (c cache[T]) Store(v T) error {
-	slog.Info("Saving provider data to disk", "path", c.path)
-	if err := os.MkdirAll(filepath.Dir(c.path), 0o755); err != nil {
-		return fmt.Errorf("failed to create directory for provider cache: %w", err)
-	}
-
 	data, err := json.Marshal(v)
 	if err != nil {
 		return fmt.Errorf("failed to marshal provider data: %w", err)
+	}
+	return c.StoreRaw(data)
+}
+
+// StoreRaw caches data exactly as given, so that Get derives the same ETag
+// the server computed for it.
+func (c cache[T]) StoreRaw(data []byte) error {
+	slog.Info("Saving provider data to disk", "path", c.path)
+	if err := os.MkdirAll(filepath.Dir(c.path), 0o755); err != nil {
+		return fmt.Errorf("failed to create directory for provider cache: %w", err)
 	}
 
 	// Written through a temporary file and renamed into place. Several Crush

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"sync"
@@ -17,15 +18,22 @@ import (
 )
 
 type hyperClient interface {
-	Get(context.Context, string) (catwalk.Provider, error)
+	// Get returns the provider and the response body it was decoded from,
+	// which the cache keeps verbatim so its ETag matches the server's. See
+	// httpCatwalkClient for why.
+	Get(ctx context.Context, etag string) (catwalk.Provider, []byte, error)
 }
 
 var _ syncer[catwalk.Provider] = (*hyperSync)(nil)
 
+// hyperSync serves the Hyper provider stale-while-revalidate, like
+// catwalkSync.
 type hyperSync struct {
 	once       sync.Once
+	mu         sync.Mutex // Guards result, err and stale after the once.
 	result     catwalk.Provider
 	err        error
+	stale      bool
 	cache      cache[catwalk.Provider]
 	client     hyperClient
 	autoupdate bool
@@ -42,6 +50,8 @@ func (s *hyperSync) Init(client hyperClient, path string, autoupdate bool) {
 // SetClient replaces the HTTP client used for fetching. This is used
 // before Refetch to ensure the latest credentials are used.
 func (s *hyperSync) SetClient(client hyperClient) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.client = client
 }
 
@@ -53,68 +63,91 @@ func (s *hyperSync) Get(ctx context.Context) (catwalk.Provider, error) {
 	// The result and the error are memoized together so that every caller
 	// sees the same outcome, not just the one that won the once.
 	s.once.Do(func() {
-		s.fetch(ctx)
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if !s.autoupdate {
+			slog.Info("Using embedded Hyper provider")
+			s.result = hyper.Embedded()
+			return
+		}
+		if cached, _, err := s.cache.Get(); err == nil && cached.ID != "" {
+			slog.Info("Using cached Hyper provider until revalidated")
+			s.result, s.stale = cached, true
+			return
+		}
+		s.result, _, s.err = s.fetch(ctx, hyper.Embedded(), "")
 	})
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.result, s.err
 }
 
-// Refetch resets the memoized result and re-fetches the Hyper provider.
-// Must not be called concurrently with Get.
+// Refetch fetches the Hyper provider now, ignoring the cache. Used after
+// signing in, when the catalog may differ for the new account.
 func (s *hyperSync) Refetch(ctx context.Context) (catwalk.Provider, error) {
 	if !s.init.Load() {
 		panic("called Refetch before Init")
 	}
-	s.once = sync.Once{}
-	s.once.Do(func() {
-		s.fetch(ctx)
-	})
+	s.once.Do(func() {}) // A later Get must not replace this result.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.autoupdate {
+		s.result, s.err = hyper.Embedded(), nil
+		return s.result, nil
+	}
+	s.stale = false
+	fallback := s.result
+	if fallback.ID == "" {
+		fallback = hyper.Embedded()
+	}
+	_, etag, _ := s.cache.Get()
+	s.result, _, s.err = s.fetch(ctx, fallback, etag)
 	return s.result, s.err
 }
 
-// fetch performs the actual Hyper provider fetch. It is called from both
-// Get (via sync.Once) and Refetch (after resetting sync.Once).
-func (s *hyperSync) fetch(ctx context.Context) {
-	s.err = nil
-	if !s.autoupdate {
-		slog.Info("Using embedded Hyper provider")
-		s.result = hyper.Embedded()
-		return
+// Revalidate asks Hyper whether the provider Get served from the cache is
+// still current, and reports whether it changed. It does nothing unless Get
+// served a cached provider.
+func (s *hyperSync) Revalidate(ctx context.Context) (bool, error) {
+	if !s.init.Load() {
+		return false, nil
 	}
-
-	cached, etag, cachedErr := s.cache.Get()
-	if cached.ID == "" || cachedErr != nil {
-		// if cached file is empty, default to embedded provider
-		cached = hyper.Embedded()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.stale {
+		return false, nil
 	}
-
-	slog.Info("Fetching Hyper provider")
-	result, err := s.client.Get(ctx, etag)
-	if errors.Is(err, context.DeadlineExceeded) {
-		slog.Warn("Hyper provider not updated in time")
-		s.result = cached
-		return
-	}
-	if errors.Is(err, catwalk.ErrNotModified) {
-		slog.Info("Hyper provider not modified")
-		s.result = cached
-		return
-	}
-	if err != nil {
-		slog.Warn("Could not fetch the Hyper provider", "error", err)
-		s.result = cached
-		return
-	}
-	if len(result.Models) == 0 {
-		slog.Warn("Hyper did not return any models")
-		s.result = cached
-		return
-	}
-
-	// The provider is usable from here on. A cache write failure only
-	// costs the next run a refresh, so it is reported alongside a valid
-	// result rather than in place of one.
+	s.stale = false
+	_, etag, _ := s.cache.Get()
+	result, changed, err := s.fetch(ctx, s.result, etag)
 	s.result = result
-	s.err = s.cache.Store(result)
+	return changed, err
+}
+
+// fetch asks Hyper for the provider, falling back to fallback when it is
+// unchanged or unreachable. Caller must hold mu.
+func (s *hyperSync) fetch(ctx context.Context, fallback catwalk.Provider, etag string) (catwalk.Provider, bool, error) {
+	slog.Info("Fetching Hyper provider")
+	result, raw, err := s.client.Get(ctx, etag)
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		slog.Warn("Hyper provider not updated in time")
+		return fallback, false, nil
+	case errors.Is(err, catwalk.ErrNotModified):
+		slog.Info("Hyper provider not modified")
+		return fallback, false, nil
+	case err != nil:
+		slog.Warn("Could not fetch the Hyper provider", "error", err)
+		return fallback, false, nil
+	case len(result.Models) == 0:
+		slog.Warn("Hyper did not return any models")
+		return fallback, false, nil
+	}
+
+	// The provider is usable from here on. A cache write failure only costs
+	// the next run a refresh, so it is reported alongside a valid result
+	// rather than in place of one.
+	return result, true, s.cache.StoreRaw(raw)
 }
 
 var _ hyperClient = realHyperClient{}
@@ -126,20 +159,20 @@ type realHyperClient struct {
 }
 
 // Get implements hyperClient.
-func (r realHyperClient) Get(ctx context.Context, etag string) (catwalk.Provider, error) {
-	result, err := r.doGet(ctx, etag)
+func (r realHyperClient) Get(ctx context.Context, etag string) (catwalk.Provider, []byte, error) {
+	result, raw, err := r.doGet(ctx, etag)
 	if err != nil && isHTTPUnauthorized(err) && r.refreshToken != nil {
 		slog.Info("Received 401 fetching Hyper provider, refreshing token and retrying")
 		if refreshErr := r.refreshToken(ctx); refreshErr != nil {
 			slog.Warn("Failed to refresh Hyper token", "error", refreshErr)
-			return result, err
+			return result, raw, err
 		}
-		result, err = r.doGet(ctx, "")
+		result, raw, err = r.doGet(ctx, "")
 	}
-	return result, err
+	return result, raw, err
 }
 
-func (r realHyperClient) doGet(ctx context.Context, etag string) (catwalk.Provider, error) {
+func (r realHyperClient) doGet(ctx context.Context, etag string) (catwalk.Provider, []byte, error) {
 	var result catwalk.Provider
 	req, err := http.NewRequestWithContext(
 		ctx,
@@ -148,7 +181,7 @@ func (r realHyperClient) doGet(ctx context.Context, etag string) (catwalk.Provid
 		nil,
 	)
 	if err != nil {
-		return result, fmt.Errorf("could not create request: %w", err)
+		return result, nil, fmt.Errorf("could not create request: %w", err)
 	}
 	xetag.Request(req, etag)
 	if apiKey := r.resolveKey(); apiKey != "" {
@@ -158,27 +191,28 @@ func (r realHyperClient) doGet(ctx context.Context, etag string) (catwalk.Provid
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return result, fmt.Errorf("failed to make request: %w", err)
+		return result, nil, fmt.Errorf("failed to make request: %w", err)
 	}
 	defer resp.Body.Close() //nolint:errcheck
 
-	if resp.StatusCode == http.StatusNotModified {
-		return result, catwalk.ErrNotModified
+	switch resp.StatusCode {
+	case http.StatusOK:
+	case http.StatusNotModified:
+		return result, nil, catwalk.ErrNotModified
+	case http.StatusUnauthorized:
+		return result, nil, errUnauthorized
+	default:
+		return result, nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
 
-	if resp.StatusCode == http.StatusUnauthorized {
-		return result, errUnauthorized
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return result, nil, fmt.Errorf("failed to read response: %w", err)
 	}
-
-	if resp.StatusCode != http.StatusOK {
-		return result, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	if err := json.Unmarshal(body, &result); err != nil {
+		return result, nil, fmt.Errorf("failed to decode response: %w", err)
 	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return result, fmt.Errorf("failed to decode response: %w", err)
-	}
-
-	return result, nil
+	return result, body, nil
 }
 
 // errUnauthorized is a sentinel for HTTP 401 responses from the Hyper API.

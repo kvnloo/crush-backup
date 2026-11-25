@@ -4,10 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"strings"
+	"sync/atomic"
 	"testing"
 
 	"charm.land/catwalk/v3/pkg/catwalk"
+	xetag "github.com/charmbracelet/x/etag"
 	"github.com/stretchr/testify/require"
 )
 
@@ -17,9 +22,57 @@ type mockCatwalkClient struct {
 	callCount int
 }
 
-func (m *mockCatwalkClient) GetProviders(ctx context.Context, etag string) ([]catwalk.Provider, error) {
+func (m *mockCatwalkClient) GetProviders(ctx context.Context, etag string) ([]catwalk.Provider, []byte, error) {
 	m.callCount++
-	return m.providers, m.err
+	if m.err != nil {
+		return nil, nil, m.err
+	}
+	raw, err := json.Marshal(m.providers)
+	return m.providers, raw, err
+}
+
+// TestCatwalkSync_CachedETagMatchesServer guards against caching a
+// re-marshaled catalog: fields this build does not know would be dropped,
+// the cached ETag would never match the server's, and every startup would
+// download the whole catalog again.
+func TestCatwalkSync_CachedETagMatchesServer(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`[{"id":"fresh","name":"Fresh","field_from_the_future":{"x":1}}]`)
+	tag := xetag.Of(body)
+	var full, notModified atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Trim(r.Header.Get("If-None-Match"), `"`) == tag {
+			notModified.Add(1)
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		full.Add(1)
+		w.Header().Set("ETag", `"`+tag+`"`)
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(server.Close)
+	path := t.TempDir() + "/providers.json"
+
+	first := &catwalkSync{}
+	first.Init(newCatwalkClient(server.URL), path, true)
+	providers, err := first.Get(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, "Fresh", providers[0].Name)
+	require.True(t, first.Updated())
+
+	second := &catwalkSync{}
+	second.Init(newCatwalkClient(server.URL), path, true)
+	providers, err = second.Get(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, "Fresh", providers[0].Name)
+	require.EqualValues(t, 0, notModified.Load(), "a startup with a cache does not wait on the network")
+	changed, err := second.Revalidate(t.Context())
+	require.NoError(t, err)
+	require.False(t, changed)
+	require.False(t, second.Updated(), "an unchanged catalog is not an update")
+	require.EqualValues(t, 1, full.Load(), "the second startup must not download the catalog again")
+	require.EqualValues(t, 1, notModified.Load())
 }
 
 func TestCatwalkSync_Init(t *testing.T) {
@@ -145,7 +198,47 @@ func TestCatwalkSync_GetNotModifiedUsesCached(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, providers, 1)
 	require.Equal(t, "Cached Provider", providers[0].Name)
+	require.Equal(t, 0, client.callCount, "a cached catalog is served without a request")
+
+	changed, err := syncer.Revalidate(t.Context())
+	require.NoError(t, err)
+	require.False(t, changed)
 	require.Equal(t, 1, client.callCount)
+	changed, err = syncer.Revalidate(t.Context())
+	require.NoError(t, err)
+	require.False(t, changed)
+	require.Equal(t, 1, client.callCount, "a catalog is revalidated once per process")
+	providers, _ = syncer.Get(t.Context())
+	require.Equal(t, "Cached Provider", providers[0].Name)
+}
+
+func TestCatwalkSync_RevalidateReplacesCachedCatalog(t *testing.T) {
+	t.Parallel()
+
+	path := t.TempDir() + "/providers.json"
+	data, err := json.Marshal([]catwalk.Provider{{Name: "Cached Provider", ID: "cached"}})
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(path, data, 0o644))
+
+	syncer := &catwalkSync{}
+	client := &mockCatwalkClient{providers: []catwalk.Provider{{Name: "Fresh Provider", ID: "fresh"}}}
+	syncer.Init(client, path, true)
+
+	providers, err := syncer.Get(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, "Cached Provider", providers[0].Name)
+	require.False(t, syncer.Updated())
+
+	changed, err := syncer.Revalidate(t.Context())
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.True(t, syncer.Updated())
+	providers, _ = syncer.Get(t.Context())
+	require.Equal(t, "Fresh Provider", providers[0].Name)
+
+	cached, _, err := syncer.cache.Get()
+	require.NoError(t, err)
+	require.Equal(t, "Fresh Provider", cached[0].Name, "the next startup gets the fresh catalog")
 }
 
 func TestCatwalkSync_GetEmptyResultFallbackToCached(t *testing.T) {
@@ -169,9 +262,13 @@ func TestCatwalkSync_GetEmptyResultFallbackToCached(t *testing.T) {
 
 	syncer.Init(client, path, true)
 
-	providers, err := syncer.Get(t.Context())
+	_, err = syncer.Get(t.Context())
+	require.NoError(t, err)
+	changed, err := syncer.Revalidate(t.Context())
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "empty providers list from catwalk")
+	require.False(t, changed)
+	providers, _ := syncer.Get(t.Context())
 	require.Len(t, providers, 1)
 	require.Equal(t, "Cached Provider", providers[0].Name)
 }

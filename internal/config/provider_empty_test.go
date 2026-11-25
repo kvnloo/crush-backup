@@ -11,8 +11,8 @@ import (
 
 type emptyProviderClient struct{}
 
-func (m *emptyProviderClient) GetProviders(context.Context, string) ([]catwalk.Provider, error) {
-	return []catwalk.Provider{}, nil
+func (m *emptyProviderClient) GetProviders(context.Context, string) ([]catwalk.Provider, []byte, error) {
+	return []catwalk.Provider{}, []byte("[]"), nil
 }
 
 // TestCatwalkSync_GetEmptyResultFromClient tests that when the client returns

@@ -20,9 +20,13 @@ type mockHyperClient struct {
 	callCount int
 }
 
-func (m *mockHyperClient) Get(ctx context.Context, etag string) (catwalk.Provider, error) {
+func (m *mockHyperClient) Get(ctx context.Context, etag string) (catwalk.Provider, []byte, error) {
 	m.callCount++
-	return m.provider, m.err
+	if m.err != nil {
+		return catwalk.Provider{}, nil, m.err
+	}
+	raw, err := json.Marshal(m.provider)
+	return m.provider, raw, err
 }
 
 func TestHyperSync_Init(t *testing.T) {
@@ -101,7 +105,14 @@ func TestHyperSync_GetNotModifiedUsesCached(t *testing.T) {
 	provider, err := syncer.Get(t.Context())
 	require.NoError(t, err)
 	require.Equal(t, "Cached Hyper", provider.Name)
+	require.Equal(t, 0, client.callCount, "a cached provider is served without a request")
+
+	changed, err := syncer.Revalidate(t.Context())
+	require.NoError(t, err)
+	require.False(t, changed)
 	require.Equal(t, 1, client.callCount)
+	provider, _ = syncer.Get(t.Context())
+	require.Equal(t, "Cached Hyper", provider.Name)
 }
 
 func TestHyperSync_GetClientError(t *testing.T) {
@@ -237,7 +248,7 @@ func TestRealHyperClient_RetryOn401(t *testing.T) {
 		refreshToken: func(ctx context.Context) error { refreshCalled = true; return nil },
 	}
 
-	provider, err := client.Get(t.Context(), "")
+	provider, _, err := client.Get(t.Context(), "")
 	require.NoError(t, err)
 	require.Equal(t, "Hyper", provider.Name)
 	require.True(t, refreshCalled, "token refresher should have been called")
@@ -259,7 +270,7 @@ func TestRealHyperClient_NoRetryWithoutRefresher(t *testing.T) {
 		resolveKey: func() string { return "test-key" },
 	}
 
-	_, err := client.Get(t.Context(), "")
+	_, _, err := client.Get(t.Context(), "")
 	require.ErrorIs(t, err, errUnauthorized)
 	require.Equal(t, int32(1), callCount.Load(), "should not retry without refresher")
 }
@@ -280,7 +291,7 @@ func TestRealHyperClient_RefreshFailureReturnsOriginalError(t *testing.T) {
 		refreshToken: func(ctx context.Context) error { return errors.New("refresh failed") },
 	}
 
-	_, err := client.Get(t.Context(), "")
+	_, _, err := client.Get(t.Context(), "")
 	require.ErrorIs(t, err, errUnauthorized)
 	require.Equal(t, int32(1), callCount.Load(), "should not retry when refresh fails")
 }
@@ -309,7 +320,7 @@ func TestRealHyperClient_SuccessWithoutRetry(t *testing.T) {
 		refreshToken: func(ctx context.Context) error { refreshCalled = true; return nil },
 	}
 
-	provider, err := client.Get(t.Context(), "")
+	provider, _, err := client.Get(t.Context(), "")
 	require.NoError(t, err)
 	require.Equal(t, "Hyper", provider.Name)
 	require.False(t, refreshCalled, "refresher should not be called on success")
