@@ -964,10 +964,9 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 	// Generate title from the first real (non-shell) user prompt in the
 	// background; Run must not wait on it. CancelAll drains it instead.
 	if !hasUserTextMessage(msgs) {
-		titleCtx := context.WithoutCancel(ctx)
-		a.titles.begin()
+		titleCtx, endTitle := a.titles.begin(ctx)
 		go func() {
-			defer a.titles.end()
+			defer endTitle()
 			a.generateTitle(titleCtx, call.SessionID, call.Prompt)
 		}()
 	}
@@ -1966,8 +1965,8 @@ func hasUserTextMessage(msgs []message.Message) bool {
 
 // GenerateTitle generates a session title based on the initial prompt.
 func (a *sessionAgent) GenerateTitle(ctx context.Context, sessionID string, userPrompt string) {
-	a.titles.begin()
-	defer a.titles.end()
+	ctx, endTitle := a.titles.begin(ctx)
+	defer endTitle()
 	a.generateTitle(ctx, sessionID, userPrompt)
 }
 
@@ -2389,6 +2388,9 @@ func (a *sessionAgent) CancelAll() {
 			time.Sleep(200 * time.Millisecond)
 		}
 	}
+	// Quitting should not wait on the model for a title nobody has seen
+	// yet. Stopped titles still save a fallback, which wait covers.
+	a.titles.stop()
 	if !a.titles.wait(time.Until(deadline)) {
 		slog.Warn("Gave up waiting for session title generation to finish")
 	}
