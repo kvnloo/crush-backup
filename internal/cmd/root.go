@@ -178,6 +178,7 @@ crush --continue
 			slog.Warn("Failed to detach stderr from the terminal", "error", err)
 		}
 		_, err = program.Run()
+		startuptrace.Phase(cmd.Context(), "TUI stopped", func() {})
 		restoreStderr()
 		if err != nil {
 			event.Error(err)
@@ -188,7 +189,9 @@ crush --continue
 		if cfg := com.Config(); cfg != nil {
 			banner = cfg.Options.TUI.ExitBanner
 		}
-		printSessionResume(model, com.Styles, banner)
+		startuptrace.Phase(cmd.Context(), "exit banner", func() {
+			printSessionResume(model, com.Styles, banner)
+		})
 		return nil
 	},
 }

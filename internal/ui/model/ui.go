@@ -2715,6 +2715,7 @@ func (m *UI) handleDialogMsg(msg tea.Msg) tea.Cmd {
 		})
 		m.dialog.CloseDialog(dialog.CommandsID)
 	case dialog.ActionQuit:
+		startuptrace.Quitting()
 		cmds = append(cmds, tea.Quit)
 	case dialog.ActionEnableDockerMCP:
 		m.dialog.CloseDialog(dialog.CommandsID)
@@ -4008,7 +4009,7 @@ func mouseMode(enabled, wantsMotion bool) tea.MouseMode {
 
 // View renders the UI model's view.
 func (m *UI) View() tea.View {
-	startuptrace.Stop()
+	startuptrace.FirstFrame()
 	var v tea.View
 	v.AltScreen = true
 	if !m.isTransparent {

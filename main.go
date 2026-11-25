@@ -15,7 +15,7 @@ import (
 
 func main() {
 	startuptrace.Start()
-	defer startuptrace.Stop()
+	defer startuptrace.Exiting()
 
 	if os.Getenv("CRUSH_PROFILE") != "" {
 		go func() {

@@ -33,7 +33,12 @@ import (
 	"golang.org/x/exp/trace"
 )
 
-const endMarker = "first-frame"
+// endMarkers are the log messages that end a recording, with what the
+// analysis then measures.
+var endMarkers = map[string]string{
+	"first-frame": "crush startup, until the first frame",
+	"exit":        "crush shutdown, from quitting until the process exits",
+}
 
 type state uint8
 
@@ -95,6 +100,7 @@ type graph struct {
 	start   trace.Time
 	stop    trace.Time
 	end     int
+	title   string
 }
 
 func main() {
@@ -170,7 +176,8 @@ func load(name string) (*graph, error) {
 				g.regions = append(g.regions, rg)
 			}
 		case trace.EventLog:
-			if ev.Log().Message == endMarker && g.end < 0 {
+			if title, ok := endMarkers[ev.Log().Message]; ok && g.end < 0 {
+				g.title = title
 				who := g.get(ev.Goroutine())
 				n := g.add(ev.Time())
 				if who.last >= 0 {
@@ -181,7 +188,7 @@ func load(name string) (*graph, error) {
 		}
 	}
 	if g.end < 0 {
-		return nil, fmt.Errorf("no %q log event; was the trace recorded with CRUSH_TRACE?", endMarker)
+		return nil, errors.New("no end marker; was the trace recorded with CRUSH_TRACE or CRUSH_TRACE_SHUTDOWN?")
 	}
 	g.stop = g.nodes[g.end].t
 	slices.SortFunc(g.regions, func(a, b region) int { return cmp.Compare(a.start, b.start) })
@@ -327,7 +334,7 @@ func total(path []*segment, keep func(*segment) bool) time.Duration {
 func (g *graph) printSummary(w io.Writer, path []*segment, file string) {
 	elapsed := time.Duration(g.stop - g.start)
 	cp := total(path, nil)
-	fmt.Fprintln(w, "crush startup, until the first frame")
+	fmt.Fprintln(w, g.title)
 	fmt.Fprintf(w, "  %8s  elapsed\n", dur(elapsed))
 	fmt.Fprintf(w, "  %8s  critical path: the least it can take on any number of CPUs\n", dur(cp))
 	fmt.Fprintf(w, "            %s\n", stateLine(path, cp))
@@ -428,7 +435,7 @@ func (g *graph) byPhase(path []*segment) []phase {
 		spans = append(spans, span{r.name, r.start, r.end})
 		cur = max(cur, r.end)
 	}
-	spans = append(spans, span{"TUI, until the first frame", cur, g.stop})
+	spans = append(spans, span{"until the end", cur, g.stop})
 	acc := map[string]time.Duration{}
 	var order []string
 	for _, sp := range spans {

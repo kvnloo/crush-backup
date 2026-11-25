@@ -1,6 +1,9 @@
-// Package startuptrace records a Go execution trace of Crush's startup, from
-// process start until the TUI draws its first frame. Set CRUSH_TRACE to a file
-// path to enable it, then analyze the file with scripts/critpath.
+// Package startuptrace records Go execution traces of Crush's startup and
+// shutdown for scripts/critpath to analyze.
+//
+// CRUSH_TRACE=file traces from process start until the TUI draws its first
+// frame. CRUSH_TRACE_SHUTDOWN=file traces from the moment the user confirms
+// quitting until main returns, which is when the shell gets its prompt back.
 package startuptrace
 
 import (
@@ -10,15 +13,28 @@ import (
 	"sync"
 )
 
-var (
-	file *os.File
-	once sync.Once
+// End markers the analyzer looks for to end the critical path.
+const (
+	FirstFrameMarker = "first-frame"
+	ExitMarker       = "exit"
 )
 
-// Start begins tracing when CRUSH_TRACE names a file. It is a no-op otherwise.
-func Start() {
-	path := os.Getenv("CRUSH_TRACE")
+type recording struct {
+	mu     sync.Mutex
+	file   *os.File
+	marker string
+}
+
+var rec recording
+
+func (r *recording) start(env, marker string) {
+	path := os.Getenv(env)
 	if path == "" {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.file != nil {
 		return
 	}
 	f, err := os.Create(path)
@@ -29,24 +45,35 @@ func Start() {
 		_ = f.Close()
 		return
 	}
-	file = f
+	r.file, r.marker = f, marker
 }
 
-// Stop ends the trace. Only the first call has any effect.
-func Stop() {
-	once.Do(func() {
-		if file == nil {
-			return
-		}
-		// The analyzer ends the critical path at this event.
-		trace.Log(context.Background(), "crush", "first-frame")
-		trace.Stop()
-		_ = file.Close()
-	})
+func (r *recording) stop(marker string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.file == nil || r.marker != marker {
+		return
+	}
+	trace.Log(context.Background(), "crush", marker)
+	trace.Stop()
+	_ = r.file.Close()
+	r.file = nil
 }
+
+// Start begins tracing startup when CRUSH_TRACE names a file.
+func Start() { rec.start("CRUSH_TRACE", FirstFrameMarker) }
+
+// FirstFrame ends a startup trace.
+func FirstFrame() { rec.stop(FirstFrameMarker) }
+
+// Quitting begins tracing shutdown when CRUSH_TRACE_SHUTDOWN names a file.
+func Quitting() { rec.start("CRUSH_TRACE_SHUTDOWN", ExitMarker) }
+
+// Exiting ends a shutdown trace.
+func Exiting() { rec.stop(ExitMarker) }
 
 // Phase runs fn inside a named trace region so the analyzer can split the
-// critical path by startup phase.
+// critical path by phase.
 func Phase(ctx context.Context, name string, fn func()) {
 	trace.WithRegion(ctx, name, fn)
 }

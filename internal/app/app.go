@@ -41,6 +41,7 @@ import (
 	"github.com/charmbracelet/crush/internal/shell"
 	"github.com/charmbracelet/crush/internal/skills"
 	"github.com/charmbracelet/crush/internal/sshaskpass"
+	"github.com/charmbracelet/crush/internal/startuptrace"
 	"github.com/charmbracelet/crush/internal/ui/anim"
 	"github.com/charmbracelet/crush/internal/ui/styles"
 	"github.com/charmbracelet/crush/internal/update"
@@ -1017,15 +1018,18 @@ func (app *App) Subscribe(program *tea.Program) {
 
 // Shutdown performs a graceful shutdown of the application.
 func (app *App) Shutdown() {
+	startuptrace.Quitting()
 	start := time.Now()
 	defer func() { slog.Debug("Shutdown took " + time.Since(start).String()) }()
 
 	// First, cancel all agents and wait for them to finish. This must complete
 	// before closing the DB so agents can finish writing their state.
-	if coord := app.Agent(); coord != nil {
-		coord.CancelAll()
-	}
-	app.fireSessionEnd()
+	startuptrace.Phase(context.Background(), "cancel agents", func() {
+		if coord := app.Agent(); coord != nil {
+			coord.CancelAll()
+		}
+	})
+	startuptrace.Phase(context.Background(), "session end hooks", app.fireSessionEnd)
 
 	// Shared shutdown context for all timeout-bounded cleanup.
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -1036,9 +1040,11 @@ func (app *App) Shutdown() {
 	// streaming deltas (see internal/message/message.go) and we must
 	// land them while the connection is still open.
 	if app.Messages != nil {
-		if err := app.Messages.FlushAll(shutdownCtx); err != nil {
-			slog.Error("Failed to flush pending message updates on shutdown", "error", err)
-		}
+		startuptrace.Phase(shutdownCtx, "flush messages", func() {
+			if err := app.Messages.FlushAll(shutdownCtx); err != nil {
+				slog.Error("Failed to flush pending message updates on shutdown", "error", err)
+			}
+		})
 	}
 
 	// Now run remaining cleanup tasks in parallel.
@@ -1074,7 +1080,7 @@ func (app *App) Shutdown() {
 			})
 		}
 	}
-	wg.Wait()
+	startuptrace.Phase(shutdownCtx, "parallel cleanup", wg.Wait)
 }
 
 // checkForUpdates checks for available updates.
