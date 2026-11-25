@@ -51,6 +51,7 @@ import (
 	"github.com/charmbracelet/crush/internal/session"
 	"github.com/charmbracelet/crush/internal/skills"
 	"github.com/charmbracelet/crush/internal/sshaskpass"
+	"github.com/charmbracelet/crush/internal/startuptrace"
 	"github.com/charmbracelet/crush/internal/stringext"
 	"github.com/charmbracelet/crush/internal/ui/attachments"
 	"github.com/charmbracelet/crush/internal/ui/chat"
@@ -4007,6 +4008,7 @@ func mouseMode(enabled, wantsMotion bool) tea.MouseMode {
 
 // View renders the UI model's view.
 func (m *UI) View() tea.View {
+	startuptrace.Stop()
 	var v tea.View
 	v.AltScreen = true
 	if !m.isTransparent {

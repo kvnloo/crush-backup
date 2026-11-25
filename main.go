@@ -9,10 +9,14 @@ import (
 
 	"github.com/charmbracelet/crush/internal/cmd"
 	_ "github.com/charmbracelet/crush/internal/dns"
+	"github.com/charmbracelet/crush/internal/startuptrace"
 	_ "github.com/joho/godotenv/autoload"
 )
 
 func main() {
+	startuptrace.Start()
+	defer startuptrace.Stop()
+
 	if os.Getenv("CRUSH_PROFILE") != "" {
 		go func() {
 			slog.Info("Serving pprof at localhost:6060")

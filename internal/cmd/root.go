@@ -3,6 +3,7 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	_ "embed"
 	"errors"
 	"fmt"
@@ -39,6 +40,7 @@ import (
 	"github.com/charmbracelet/crush/internal/server"
 	"github.com/charmbracelet/crush/internal/session"
 	"github.com/charmbracelet/crush/internal/skills"
+	"github.com/charmbracelet/crush/internal/startuptrace"
 	"github.com/charmbracelet/crush/internal/ui/common"
 	"github.com/charmbracelet/crush/internal/ui/exitbanner"
 	ui "github.com/charmbracelet/crush/internal/ui/model"
@@ -350,7 +352,11 @@ func loadLocalConfig(cmd *cobra.Command) (*config.ConfigStore, error) {
 	if err != nil {
 		return nil, err
 	}
-	return config.Init(cmd.Context(), cwd, dataDir, debug)
+	var store *config.ConfigStore
+	startuptrace.Phase(cmd.Context(), "config.Init", func() {
+		store, err = config.Init(cmd.Context(), cwd, dataDir, debug)
+	})
+	return store, err
 }
 
 // setupWorkspaceWithProgressBar wraps setupWorkspace with an optional
@@ -435,7 +441,10 @@ func setupLocalWorkspace(cmd *cobra.Command, store *config.ConfigStore) (workspa
 		slog.Warn("Failed to register project", "error", err)
 	}
 
-	conn, err := db.Connect(ctx, cfg.Options.DataDirectory)
+	var conn *sql.DB
+	startuptrace.Phase(ctx, "db.Connect", func() {
+		conn, err = db.Connect(ctx, cfg.Options.DataDirectory)
+	})
 	if err != nil {
 		return nil, nil, err
 	}
@@ -448,15 +457,21 @@ func setupLocalWorkspace(cmd *cobra.Command, store *config.ConfigStore) (workspa
 	// globals (which the TUI reads via skills.GetLatestStates) in sync
 	// with the manager.
 	discoveryCfg := localSkillsDiscoveryConfig(store)
-	allSkills, activeSkills, skillStates := skills.DiscoverFromConfig(discoveryCfg)
-	skillsMgr := skills.NewManager(
-		allSkills, activeSkills, skillStates,
-		skills.WithGlobalMirror(),
-		skills.WithResolvedPaths(discoveryCfg.ResolvePaths()),
-		skills.WithWorkingDir(discoveryCfg.WorkingDir),
-	)
+	var skillsMgr *skills.Manager
+	startuptrace.Phase(ctx, "skills.Discover", func() {
+		allSkills, activeSkills, skillStates := skills.DiscoverFromConfig(discoveryCfg)
+		skillsMgr = skills.NewManager(
+			allSkills, activeSkills, skillStates,
+			skills.WithGlobalMirror(),
+			skills.WithResolvedPaths(discoveryCfg.ResolvePaths()),
+			skills.WithWorkingDir(discoveryCfg.WorkingDir),
+		)
+	})
 
-	appInstance, err := app.New(ctx, conn, store, skillsMgr)
+	var appInstance *app.App
+	startuptrace.Phase(ctx, "app.New", func() {
+		appInstance, err = app.New(ctx, conn, store, skillsMgr)
+	})
 	if err != nil {
 		_ = conn.Close()
 		slog.Error("Failed to create app instance", "error", err)
