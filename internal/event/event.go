@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/charmbracelet/crush/internal/version"
@@ -51,62 +53,121 @@ func SetContinueLastSession(continueLastSession bool) {
 	baseProps = baseProps.Set(continueLastSessionAttrName, continueLastSession)
 }
 
+// Setting up the client is slow: the machine ID comes from running ioreg,
+// and PostHog probes the OS version with sw_vers. Init therefore does it in
+// the background, and events sent in the meantime wait in pending until the
+// client is ready.
+var (
+	started atomic.Bool
+	ready   = make(chan struct{})
+	mu      sync.Mutex
+	isReady bool
+	pending []func()
+)
+
+// Init starts the PostHog client in the background. Only the first call has
+// any effect.
 func Init() {
-	c, err := posthog.NewWithConfig(key, posthog.Config{
-		Endpoint:        endpoint,
-		Logger:          logger{},
-		ShutdownTimeout: 500 * time.Millisecond,
-	})
-	if err != nil {
-		slog.Error("Failed to initialize PostHog client", "error", err)
+	if !started.CompareAndSwap(false, true) {
+		return
 	}
-	client = c
-	distinctId = getDistinctId()
+	go func() {
+		c, err := posthog.NewWithConfig(key, posthog.Config{
+			Endpoint:        endpoint,
+			Logger:          logger{},
+			ShutdownTimeout: 500 * time.Millisecond,
+		})
+		if err != nil {
+			slog.Error("Failed to initialize PostHog client", "error", err)
+		}
+		id := getDistinctId()
+
+		mu.Lock()
+		defer mu.Unlock()
+		client, distinctId = c, id
+		isReady = true
+		close(ready)
+		for _, f := range pending {
+			f()
+		}
+		pending = nil
+	}()
 }
 
-func GetID() string { return distinctId }
+// whenReady runs f once the client is ready, right away if it already is.
+// Without Init it drops f, as metrics are disabled.
+func whenReady(f func()) {
+	if !started.Load() {
+		return
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if isReady {
+		f()
+		return
+	}
+	pending = append(pending, f)
+}
+
+// waitReady blocks until Init has finished, and reports whether it ran.
+func waitReady() bool {
+	if !started.Load() {
+		return false
+	}
+	<-ready
+	return true
+}
+
+// GetID returns the machine's anonymous ID, waiting for Init to compute it.
+func GetID() string {
+	waitReady()
+	return distinctId
+}
 
 // send logs an event to PostHog with the given event name and properties.
 func send(event string, props ...any) {
-	if client == nil {
-		return
-	}
-	err := client.Enqueue(posthog.Capture{
-		DistinctId: distinctId,
-		Event:      event,
-		Properties: pairsToProps(props...).Merge(baseProps),
+	properties := pairsToProps(props...).Merge(baseProps)
+	whenReady(func() {
+		if client == nil {
+			return
+		}
+		err := client.Enqueue(posthog.Capture{
+			DistinctId: distinctId,
+			Event:      event,
+			Properties: properties,
+		})
+		if err != nil {
+			slog.Error("Failed to enqueue PostHog event", "event", event, "props", props, "error", err)
+		}
 	})
-	if err != nil {
-		slog.Error("Failed to enqueue PostHog event", "event", event, "props", props, "error", err)
-		return
-	}
 }
 
 // Error logs an error event to PostHog with the error type and message.
 func Error(errToLog any, props ...any) {
-	if client == nil || distinctId == "" || errToLog == nil {
+	if errToLog == nil {
 		return
 	}
-
-	exception := posthog.NewDefaultException(
-		time.Now(),
-		distinctId,
-		reflect.TypeOf(errToLog).String(),
-		fmt.Sprintf("%v", errToLog),
-	)
-	if exception.Properties == nil {
-		exception.Properties = posthog.NewProperties()
-	}
-	exception.Properties = exception.Properties.Merge(pairsToProps(props...))
-
-	if posthogErr := client.Enqueue(exception); posthogErr != nil {
-		slog.Error("Failed to enqueue PostHog error", "err", errToLog, "props", props, "posthogErr", posthogErr)
-		return
-	}
+	at := time.Now()
+	errType, msg := reflect.TypeOf(errToLog).String(), fmt.Sprintf("%v", errToLog)
+	properties := pairsToProps(props...)
+	whenReady(func() {
+		if client == nil || distinctId == "" {
+			return
+		}
+		exception := posthog.NewDefaultException(at, distinctId, errType, msg)
+		if exception.Properties == nil {
+			exception.Properties = posthog.NewProperties()
+		}
+		exception.Properties = exception.Properties.Merge(properties)
+		if posthogErr := client.Enqueue(exception); posthogErr != nil {
+			slog.Error("Failed to enqueue PostHog error", "err", errToLog, "props", props, "posthogErr", posthogErr)
+		}
+	})
 }
 
+// Flush sends every queued event, waiting for Init to finish first.
 func Flush() {
-	if client == nil {
+	if !waitReady() || client == nil {
 		return
 	}
 	if err := client.Close(); err != nil {
