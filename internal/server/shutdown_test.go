@@ -232,7 +232,10 @@ func TestServe_ClosesUnattachedWorkspaceWhenIdleShutdownDisabled(t *testing.T) {
 		return errors.Is(err, backend.ErrWorkspaceNotFound)
 	}, 5*time.Second, 10*time.Millisecond,
 		"an unattached workspace must expire while idle shutdown is disabled")
-	require.Equal(t, int32(1), tornDown.Load())
+	// Teardown unregisters the workspace before it runs the shutdown hook,
+	// so the hook can still be in flight once the lookup fails.
+	require.Eventually(t, func() bool { return tornDown.Load() == 1 },
+		5*time.Second, 10*time.Millisecond, "the expired workspace was never torn down")
 
 	select {
 	case err := <-served:
