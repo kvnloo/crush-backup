@@ -103,6 +103,7 @@ type ConfigStore struct {
 	workspacePath      string   // .crush/crush.json
 	loadedPaths        []string // config files that were successfully loaded
 	knownProviders     []catwalk.Provider
+	providerGens       providerGens // The catalog versions knownProviders came from.
 	overrides          RuntimeOverrides
 	trackedConfigPaths []string                // unique, normalized config file paths
 	snapshots          map[string]fileSnapshot // path -> snapshot at last capture
@@ -207,11 +208,10 @@ func (s *ConfigStore) RefetchHyperProvider(ctx context.Context) error {
 	// not the stale snapshot captured at startup. The syncer's original
 	// client closes over the startup config and would send an expired
 	// token after OAuth re-authentication.
-	freshClient := realHyperClient{
+	hyperSyncer.SetFetch(realHyperClient{
 		baseURL:    hyperp.BaseURL(),
 		resolveKey: func() string { return ResolveHyperAPIKey(s.Config()) },
-	}
-	hyperSyncer.SetClient(freshClient)
+	}.Get)
 
 	hyperProvider, err := hyperSyncer.Refetch(ctx)
 	if err != nil {
@@ -249,10 +249,6 @@ func (s *ConfigStore) RefetchHyperProvider(ctx context.Context) error {
 		nc.Providers.Set(string(hyperProvider.ID), pc)
 	}
 	s.setConfig(nc)
-
-	// Also update the memoized provider list so callers of
-	// config.Providers() (e.g. the models dialog) see fresh data.
-	UpdateProviderInList(hyperProvider)
 
 	s.SetupAgents()
 	return nil
@@ -1478,7 +1474,7 @@ func (s *ConfigStore) reloadFromDiskLocked(ctx context.Context) error {
 	oldConfig := s.Config()
 	oldLoadedPaths := s.loadedPaths
 	oldResolver := s.resolver
-	oldKnownProviders := s.knownProviders
+	oldKnownProviders, oldProviderGens := s.knownProviders, s.providerGens
 	oldOverrides := s.overrides
 	oldWorkspacePath := s.workspacePath
 
@@ -1500,6 +1496,7 @@ func (s *ConfigStore) reloadFromDiskLocked(ctx context.Context) error {
 	// like AWS_PROFILE are visible to the AWS SDK credential chain.
 	cfg.applyEnv(resolver)
 
+	gens := currentProviderGens()
 	providers, err := Providers(cfg)
 	if err != nil {
 		if len(providers) == 0 {
@@ -1517,6 +1514,7 @@ func (s *ConfigStore) reloadFromDiskLocked(ctx context.Context) error {
 	s.loadedPaths = loadedPaths
 	s.resolver = resolver
 	s.knownProviders = providers
+	s.providerGens = gens
 	s.overrides = overrides
 	s.workspacePath = workspacePath
 
@@ -1540,7 +1538,7 @@ func (s *ConfigStore) reloadFromDiskLocked(ctx context.Context) error {
 		s.setConfig(oldConfig)
 		s.loadedPaths = oldLoadedPaths
 		s.resolver = oldResolver
-		s.knownProviders = oldKnownProviders
+		s.knownProviders, s.providerGens = oldKnownProviders, oldProviderGens
 		s.overrides = oldOverrides
 		s.workspacePath = oldWorkspacePath
 		return setupErr
