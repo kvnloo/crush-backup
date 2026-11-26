@@ -18,6 +18,7 @@ import (
 	"charm.land/catwalk/v3/pkg/embedded"
 	"github.com/charmbracelet/crush/internal/agent/hyper"
 	"github.com/charmbracelet/crush/internal/csync"
+	"github.com/charmbracelet/crush/internal/fsext"
 	"github.com/charmbracelet/x/etag"
 )
 
@@ -264,7 +265,7 @@ func newCache[T any](path string) cache[T] {
 
 func (c cache[T]) Get() (T, string, error) {
 	var v T
-	data, err := readFile(c.path)
+	data, err := fsext.ReadFile(c.path)
 	if err != nil {
 		return v, "", fmt.Errorf("failed to read provider cache file: %w", err)
 	}
