@@ -160,6 +160,10 @@ func TestKill_ShebangScriptChild(t *testing.T) {
 		pid, err = strconv.Atoi(strings.TrimSpace(string(data)))
 		return err == nil && pid > 1
 	}, 5*time.Second, 10*time.Millisecond, "script never recorded its child PID")
+	// The PID is written right after the fork, before the child has set
+	// SIGINT to ignored and become sleep; a SIGINT in that window kills it
+	// outright and Kill returns at once.
+	requireDescendant(t, "sleep 15")
 
 	// The child survives SIGINT, so Kill must wait out the grace period
 	// before the SIGKILL escalation takes it down.
